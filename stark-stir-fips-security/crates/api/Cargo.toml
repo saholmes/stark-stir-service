@@ -1,0 +1,46 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# Default: SHA3-256 + rayon parallel proving.  Disable with
+# `--no-default-features` if a single-threaded build is desired (e.g. on
+# constrained edge devices).  The hash variant is a compile-time choice.
+default  = ["sha3-256", "parallel"]
+sha3-256 = ["deep_ali/sha3-256"]
+sha3-384 = ["deep_ali/sha3-384"]
+sha3-512 = ["deep_ali/sha3-512"]
+parallel = ["deep_ali/parallel"]
+# Optional Poseidon-accelerated leaf compression (paper dual-hash).
+poseidon-accel = ["deep_ali/poseidon-accel"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+public-inputs = { path = "../public-inputs" }
+
+[dependencies]
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+auth = { path = "../auth" }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "1"
+hex = "0.4"
+sha3 = { workspace = true }
+digest = { workspace = true }
+ark-ff = { workspace = true }
+ark-goldilocks = { workspace = true }
+ark-poly = { workspace = true }
+public-inputs = { path = "../public-inputs" }
+proof-store = { path = "../proof-store" }
+deep_ali = { path = "../deep_ali" }
+merkle = { path = "../merkle" }
+transcript = { path = "../transcript" }

@@ -1,0 +1,19 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OAuth2-style token store + admin user management for the STARK API"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { version = "0.4", features = ["serde"] }
+thiserror   = "1"
+hex         = "0.4"
+rand        = { workspace = true }
+rusqlite    = { version = "0.31", features = ["bundled"] }
+argon2      = "0.5"
+sha3        = { workspace = true }
+uuid        = { version = "1", features = ["v4", "serde"] }
