@@ -41,3 +41,4 @@ criterion = "0.5"
 ark-goldilocks = { path = "./crates/ark-goldilocks", version = "0.1.0" }
 sha3 = "0.10"
 digest = "0.10"
+fips204 = "0.4"

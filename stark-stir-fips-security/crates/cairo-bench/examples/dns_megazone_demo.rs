@@ -36,6 +36,7 @@ use deep_ali::{
 };
 
 use cairo_bench::dns::{merkle_build, merkle_path, merkle_root, merkle_verify, DnsRecord};
+use cairo_bench::dns_authority::{level_hash, pk_binding_hash, AuthorityKeypair, NistLevel};
 
 type Ext = SexticExt;
 const BLOWUP: usize = 32;     // paper Table III: 1/ρ₀ = 32 calibration
@@ -46,14 +47,43 @@ const SEED_Z: u64 = 0xDEEF_BAAD;
 //  CLI parsing (no external deps)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Low-degree-test mode for the rollup proofs. STIR is the default; FRI
+/// arity-2 is kept for comparison benchmarks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ldt { Stir, Fri }
+
+impl Ldt {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "stir" => Ok(Self::Stir),
+            "fri"  => Ok(Self::Fri),
+            other  => Err(format!("invalid --ldt '{other}' (expected stir or fri)")),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self { Self::Stir => "STIR", Self::Fri => "FRI (arity-2)" }
+    }
+    fn short(self) -> &'static str {
+        match self { Self::Stir => "STIR", Self::Fri => "FRI" }
+    }
+    fn is_stir(self) -> bool { matches!(self, Self::Stir) }
+}
+
 struct Args {
     shards: usize,
     records_per_shard: usize,
+    nist_level: NistLevel,
+    ldt: Ldt,
 }
 
 impl Args {
     fn parse() -> Self {
-        let mut a = Args { shards: 5, records_per_shard: 1024 }; // --quick default
+        let mut a = Args {
+            shards: 5,
+            records_per_shard: 1024, // --quick default
+            nist_level: NistLevel::L1,
+            ldt: Ldt::Stir,
+        };
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -62,8 +92,22 @@ impl Args {
                 "--full"   => a.records_per_shard = 2_097_152,
                 "--shards" => a.shards = iter.next().unwrap().parse().unwrap(),
                 "--records-per-shard" => a.records_per_shard = iter.next().unwrap().parse().unwrap(),
+                "--nist-level" => {
+                    let v = iter.next().expect("--nist-level requires 1, 3, or 5");
+                    a.nist_level = NistLevel::parse(&v).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    });
+                }
+                "--ldt" => {
+                    let v = iter.next().expect("--ldt requires stir or fri");
+                    a.ldt = Ldt::parse(&v).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    });
+                }
                 "--help" | "-h" => {
-                    eprintln!("usage: dns_megazone_demo [--shards N] [--records-per-shard N] [--quick|--medium|--full]");
+                    eprintln!("usage: dns_megazone_demo [--shards N] [--records-per-shard N] [--quick|--medium|--full] [--nist-level 1|3|5] [--ldt stir|fri]");
                     std::process::exit(0);
                 }
                 other => {
@@ -117,8 +161,24 @@ fn build_trace_bytes(leaves: &[u64], n_trace: usize) -> Vec<Vec<F>> {
     build_hash_rollup_trace(n_trace, leaves)
 }
 
-fn make_schedule(n0: usize) -> Vec<usize> {
-    vec![2usize; n0.trailing_zeros() as usize]
+/// LDT folding schedule. Mirrors `default_schedule` in
+/// `crates/api/src/routes/prove.rs`:
+///   * STIR: arity-8 + residual to land at size 1
+///   * FRI : arity-2 binary fold (the only proven-secure FRI arity)
+fn make_schedule(n0: usize, ldt: Ldt) -> Vec<usize> {
+    assert!(n0.is_power_of_two(), "n0 must be a power of 2");
+    let log_n0 = n0.trailing_zeros() as usize;
+    if !ldt.is_stir() {
+        return vec![2usize; log_n0];
+    }
+    let log_arity = 3usize; // log2(8)
+    let full_folds = log_n0 / log_arity;
+    let remainder_log = log_n0 % log_arity;
+    let mut schedule = vec![8usize; full_folds];
+    if remainder_log > 0 {
+        schedule.push(1usize << remainder_log);
+    }
+    schedule
 }
 
 fn comb_coeffs(num: usize) -> Vec<F> {
@@ -139,9 +199,11 @@ struct ShardOutput {
 /// Returns the shard's pi_hash (32-byte commitment ready for the outer rollup),
 /// timings, and the Merkle tree (so we can demo inclusion proofs).
 fn prove_shard(
-    label:   &str,
-    salt:    &[u8; 16],
-    records: &[DnsRecord],
+    label:    &str,
+    salt:     &[u8; 16],
+    records:  &[DnsRecord],
+    pk_hash:  &[u8; 32],
+    ldt:      Ldt,
 ) -> ShardOutput {
     let total = records.len();
     println!("  [{label}] records = {total}");
@@ -179,35 +241,38 @@ fn prove_shard(
              t_setup.elapsed().as_secs_f64(), n_trace.trailing_zeros());
 
     let params = DeepFriParams {
-        schedule: make_schedule(n0),
+        schedule: make_schedule(n0, ldt),
         r: NUM_QUERIES, seed_z: SEED_Z,
         coeff_commit_final: true, d_final: 1,
-        stir: false, s0: NUM_QUERIES,
-        public_inputs_hash: None,
+        stir: ldt.is_stir(), s0: NUM_QUERIES,
+        public_inputs_hash: Some(*pk_hash),
     };
 
     let t_prove = Instant::now();
     let proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
     let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
-    println!("        FRI prove:        {:.2} s", prove_ms / 1e3);
+    println!("        {} prove:       {:.2} s", ldt.short(), prove_ms / 1e3);
 
     let t_verify = Instant::now();
     let ok = deep_fri_verify::<Ext>(&params, &proof);
     let verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
     assert!(ok, "shard {label} verify failed");
-    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, false);
-    println!("        FRI verify:       {:.2} ms   proof={} KiB", verify_ms, proof_bytes/1024);
+    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
+    println!("        {} verify:      {:.2} ms   proof={} KiB", ldt.short(), verify_ms, proof_bytes/1024);
 
     // The shard's "pi_hash" for the outer rollup is what binds this proof.
     // We synthesize a deterministic 32-byte commitment from the Merkle root
-    // + the proof's f0 commitment + record count (a domain-separated hash).
+    // + the proof's f0 commitment + record count + the authority pk_hash
+    // (a domain-separated hash).  Including pk_hash here means an attacker
+    // cannot detach this shard's pi_hash from the authority that proved it.
     let mut h = sha3::Sha3_256::new();
     use sha3::Digest;
     Digest::update(&mut h, b"DNS-SHARD-PIHASH-V1");
     Digest::update(&mut h, salt);
     Digest::update(&mut h, &(records.len() as u64).to_le_bytes());
     Digest::update(&mut h, root);
-    Digest::update(&mut h, proof.root_f0);     // binds the FRI proof
+    Digest::update(&mut h, proof.root_f0);     // binds the LDT proof
+    Digest::update(&mut h, pk_hash);           // binds the authority public key
     let pi_hash: [u8; 32] = Digest::finalize(h).into();
 
     ShardOutput {
@@ -218,7 +283,11 @@ fn prove_shard(
 }
 
 /// Aggregate N inner pi_hashes into one outer rollup STARK.
-fn prove_outer_rollup(pi_hashes: &[[u8; 32]]) -> (f64, f64, usize, [u8; 32]) {
+fn prove_outer_rollup(
+    pi_hashes: &[[u8; 32]],
+    pk_hash: &[u8; 32],
+    ldt: Ldt,
+) -> (f64, f64, usize, [u8; 32]) {
     let mut leaves: Vec<u64> = Vec::with_capacity(pi_hashes.len() * 4);
     for h in pi_hashes {
         leaves.extend_from_slice(&pack_hash_to_leaves(h));
@@ -237,11 +306,11 @@ fn prove_outer_rollup(pi_hashes: &[[u8; 32]]) -> (f64, f64, usize, [u8; 32]) {
     );
 
     let params = DeepFriParams {
-        schedule: make_schedule(n0),
+        schedule: make_schedule(n0, ldt),
         r: NUM_QUERIES, seed_z: SEED_Z,
         coeff_commit_final: true, d_final: 1,
-        stir: false, s0: NUM_QUERIES,
-        public_inputs_hash: None,
+        stir: ldt.is_stir(), s0: NUM_QUERIES,
+        public_inputs_hash: Some(*pk_hash),
     };
 
     let t_prove = Instant::now();
@@ -252,10 +321,10 @@ fn prove_outer_rollup(pi_hashes: &[[u8; 32]]) -> (f64, f64, usize, [u8; 32]) {
     assert!(deep_fri_verify::<Ext>(&params, &proof));
     let verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
 
-    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, false);
+    let proof_bytes = deep_fri_proof_size_bytes::<Ext>(&proof, params.stir);
 
-    println!("\n  outer rollup:  n_trace=2^{}  prove={:.2} s  verify={:.2} ms  proof={} KiB",
-             n_trace.trailing_zeros(), prove_ms/1e3, verify_ms, proof_bytes/1024);
+    println!("\n  outer rollup [{}]:  n_trace=2^{}  prove={:.2} s  verify={:.2} ms  proof={} KiB",
+             ldt.short(), n_trace.trailing_zeros(), prove_ms/1e3, verify_ms, proof_bytes/1024);
 
     (prove_ms, verify_ms, proof_bytes, proof.root_f0)
 }
@@ -279,10 +348,29 @@ fn main() {
     println!("  shard inner-trace    = 2^{} ({} rows)",
              next_pow2(args.records_per_shard * 4).trailing_zeros(),
              next_pow2(args.records_per_shard * 4));
+    println!("  NIST PQ level        = L{}  (signature={}, signed-digest={})",
+             match args.nist_level { NistLevel::L1=>1, NistLevel::L3=>3, NistLevel::L5=>5 },
+             args.nist_level.ml_dsa_name(),
+             args.nist_level.hash_name());
+    println!("  LDT mode             = {}", args.ldt.label());
     println!();
 
     let zone_salt: [u8; 16] = *b"example-com-2026";
     println!("  zone salt (published) = {}", hex::encode(zone_salt));
+
+    // ─── Authority keygen (deterministic seed for demo reproducibility) ──────
+    // In production the authority's signing key is generated once and held
+    // out-of-band; the demo derives both keys from a fixed seed so successive
+    // runs produce identical pk/pk_hash and the binding is reproducible.
+    const AUTHORITY_SEED: [u8; 32] = *b"DNS-AUTHORITY-DEMO-SEED-V1\0\0\0\0\0\0";
+    let authority = AuthorityKeypair::keygen(args.nist_level, AUTHORITY_SEED);
+    let pk_bytes  = authority.pk_bytes();
+    let pk_hash   = pk_binding_hash(&pk_bytes);
+    println!("  authority pk          = {} bytes ({}…)",
+             pk_bytes.len(),
+             &hex::encode(&pk_bytes[..16]));
+    println!("  authority pk_hash     = {}…  (bound into STARK FS transcript)",
+             &hex::encode(pk_hash)[..32]);
     println!();
 
     let t_total = Instant::now();
@@ -300,7 +388,7 @@ fn main() {
         println!("[shard {}/{}] generated {} records in {:.2} s",
                  s + 1, args.shards, records.len(), t_gen.elapsed().as_secs_f64());
 
-        let out = prove_shard(&label, &zone_salt, &records);
+        let out = prove_shard(&label, &zone_salt, &records, &pk_hash, args.ldt);
         outputs.push(out);
         shards_records.push(records);
         println!();
@@ -308,10 +396,57 @@ fn main() {
 
     // Outer rollup over all shard pi_hashes.
     let pi_hashes: Vec<[u8;32]> = outputs.iter().map(|o| o.pi_hash).collect();
-    let (outer_prove_ms, outer_verify_ms, outer_proof_bytes, _outer_root) =
-        prove_outer_rollup(&pi_hashes);
+    let (outer_prove_ms, outer_verify_ms, outer_proof_bytes, outer_root) =
+        prove_outer_rollup(&pi_hashes, &pk_hash, args.ldt);
 
     let total_secs = t_total.elapsed().as_secs_f64();
+
+    // ─── Authority signature over the rolled-up STARK ────────────────────────
+    // Build a level-matched SHA3 digest over everything that uniquely
+    // identifies this rollup, then ML-DSA-sign that digest.  The pk_hash
+    // is included both inside the STARK (via public_inputs_hash) AND in
+    // the signed digest, so:
+    //   (a) substituting the pk forces re-proving (FS transcript would diverge),
+    //   (b) substituting the proof forces re-signing (digest would diverge).
+    let total_records_le = (total_records as u64).to_le_bytes();
+    let nist_byte = match args.nist_level { NistLevel::L1=>1u8, NistLevel::L3=>3, NistLevel::L5=>5 };
+    let zone_digest = level_hash(args.nist_level, &[
+        b"DNS-ZONE-AUTHORITY-V1",
+        &[nist_byte],
+        &zone_salt,
+        &total_records_le,
+        &outer_root,                 // commits to outer rollup STARK
+        &pk_hash,                    // commits to the authority pk
+    ]);
+
+    let t_sign = Instant::now();
+    let signature = authority.sign(&zone_digest);
+    let sign_ms = t_sign.elapsed().as_secs_f64() * 1e3;
+
+    let t_vsig = Instant::now();
+    let sig_ok = authority.verify(&zone_digest, &signature);
+    let verify_sig_ms = t_vsig.elapsed().as_secs_f64() * 1e3;
+    assert!(sig_ok, "authority signature failed to verify");
+
+    // Tamper test: flip a byte in the digest, signature MUST be rejected.
+    let mut tampered = zone_digest.clone();
+    tampered[0] ^= 0x01;
+    let tampered_ok = authority.verify(&tampered, &signature);
+    assert!(!tampered_ok, "tampered digest must NOT verify");
+
+    println!("\n=================================================================");
+    println!("  Authority Signature on Rolled-Up STARK");
+    println!("=================================================================");
+    println!("  signature scheme     : {}  (NIST L{})",
+             args.nist_level.ml_dsa_name(), nist_byte);
+    println!("  signed-digest hash   : {}  ({} bytes)",
+             args.nist_level.hash_name(), zone_digest.len());
+    println!("  zone_digest          : {}…", &hex::encode(&zone_digest)[..32]);
+    println!("  signature size       : {} bytes", signature.len());
+    println!("  sign time            : {:.2} ms", sign_ms);
+    println!("  verify time          : {:.2} ms", verify_sig_ms);
+    println!("  ✓ signature verifies under authority pk");
+    println!("  ✓ tampered digest correctly REJECTED");
 
     // ─── Inclusion-proof demonstration for one specific record ────────────────
     println!("\n=================================================================");

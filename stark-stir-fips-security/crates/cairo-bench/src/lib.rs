@@ -7,6 +7,7 @@
 //!   - Optional `cairo-vm-trace` feature for running real Cairo 0 programs.
 
 pub mod dns;
+pub mod dns_authority;
 
 use ark_ff::PrimeField;
 use ark_goldilocks::Goldilocks as F;

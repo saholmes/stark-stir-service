@@ -23,6 +23,7 @@ rand = { workspace = true }
 rayon = "1.10"
 sha3 = { workspace = true }
 hex = "0.4"
+fips204 = { workspace = true }
 
 deep_ali    = { path = "../deep_ali" }
 proof-store = { path = "../proof-store" }
